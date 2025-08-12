@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Generator, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+from datetime import datetime, timezone, timedelta
 
 import gradio as gr
 import requests
@@ -16,7 +17,6 @@ EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
 
 
 def _http_post(url: str, payload: dict, stream: bool = False, timeout: Tuple[int, int] = (10, 600)):
-    """Thin wrapper around requests.post to centralize timeouts and error handling."""
     return requests.post(url, json=payload, stream=stream, timeout=timeout)
 
 
@@ -36,26 +36,37 @@ def _normalize(v: np.ndarray) -> np.ndarray:
     return v / norm
 
 
-def embed_text(text: str) -> Optional[np.ndarray]:
-    """Generate a single embedding using Ollama's embeddings API."""
-    if not text:
+def embed_text(text: str, retries: int = 2) -> Optional[np.ndarray]:
+    if not text or not text.strip():
         return None
+    
     url = f"{OLLAMA_URL}/api/embeddings"
-    payload = {"model": EMBED_MODEL, "prompt": text}
-    try:
-        resp = _http_post(url, payload, stream=False, timeout=(5, 60))
-        resp.raise_for_status()
-        data = resp.json()
-        vector = np.array(data.get("embedding", []), dtype=np.float32)
-        if vector.size == 0:
-            return None
-        return _normalize(vector)
-    except requests.RequestException:
-        return None
+    payload = {"model": EMBED_MODEL, "prompt": text.strip()}
+    
+    for attempt in range(retries + 1):
+        try:
+            resp = _http_post(url, payload, stream=False, timeout=(5, 30))
+            resp.raise_for_status()
+            data = resp.json()
+            
+            if "embedding" not in data or not data["embedding"]:
+                continue
+                
+            vector = np.array(data["embedding"], dtype=np.float32)
+            if vector.size == 0:
+                continue
+                
+            return _normalize(vector)
+            
+        except requests.RequestException as e:
+            if attempt == retries:
+                return None
+            time.sleep(1)
+    
+    return None
 
 
-def embed_texts(texts: List[str], max_workers: int = 5) -> List[np.ndarray]:
-    """Embed a list of texts using concurrent processing for better performance."""
+def embed_texts(texts: List[str], max_workers: int = 3) -> List[np.ndarray]:
     if not texts:
         return []
     
@@ -65,7 +76,6 @@ def embed_texts(texts: List[str], max_workers: int = 5) -> List[np.ndarray]:
         idx, text = idx_text_pair
         return idx, embed_text(text)
     
-    # Use ThreadPoolExecutor for concurrent API calls
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_idx = {
             executor.submit(embed_with_index, (i, text)): i 
@@ -77,10 +87,8 @@ def embed_texts(texts: List[str], max_workers: int = 5) -> List[np.ndarray]:
                 idx, vector = future.result()
                 vectors[idx] = vector
             except Exception:
-                # Keep None for failed embeddings
                 pass
     
-    # Convert None values to zero vectors for alignment
     result_vectors: List[np.ndarray] = []
     for vector in vectors:
         if vector is None:
@@ -92,11 +100,6 @@ def embed_texts(texts: List[str], max_workers: int = 5) -> List[np.ndarray]:
 
 
 def read_text_from_file(file_path: str) -> str:
-    """Extract text from a supported file type.
-
-    Supported: .txt, .md, .json, .csv, .py, .pdf, .docx
-    PDFs and DOCX are optional; if parser is unavailable, return empty string.
-    """
     lower = file_path.lower()
     try:
         if lower.endswith((".txt", ".md", ".py", ".csv", ".json")):
@@ -104,7 +107,7 @@ def read_text_from_file(file_path: str) -> str:
                 return f.read()
         if lower.endswith(".pdf"):
             try:
-                from pypdf import PdfReader  # type: ignore
+                from pypdf import PdfReader
             except Exception:
                 return ""
             try:
@@ -115,7 +118,7 @@ def read_text_from_file(file_path: str) -> str:
                 return ""
         if lower.endswith(".docx"):
             try:
-                import docx  # type: ignore
+                import docx
             except Exception:
                 return ""
             try:
@@ -129,11 +132,6 @@ def read_text_from_file(file_path: str) -> str:
 
 
 def chunk_text(text: str, max_chars: int = 3000, overlap: int = 300) -> List[str]:
-    """Split text into overlapping chunks by characters.
-
-    This is a pragmatic approach that avoids tokenizers while producing
-    reasonably sized chunks for RAG.
-    """
     text = (text or "").strip()
     if not text:
         return []
@@ -151,6 +149,107 @@ def chunk_text(text: str, max_chars: int = 3000, overlap: int = 300) -> List[str
         start = max(0, end - overlap)
     return chunks
 
+def get_weather(city: str) -> str:
+    latitude = 25.2048
+    longitude = 55.2708
+    try:
+        response = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": latitude,
+                "longitude": longitude,
+                "current": "temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,weather_code",
+                "timezone": "Asia/Dubai",
+            },
+            timeout=(5, 10),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        current = payload.get("current") or {}
+        temperature_c = current.get("temperature_2m")
+        feels_like_c = current.get("apparent_temperature")
+        humidity = current.get("relative_humidity_2m")
+        wind_speed = current.get("wind_speed_10m")
+        weather_code = current.get("weather_code")
+
+        def describe(code: Optional[int]) -> str:
+            if code is None:
+                return "Unknown"
+            code_map = {
+                0: "Clear",
+                1: "Mainly clear",
+                2: "Partly cloudy",
+                3: "Overcast",
+                45: "Fog",
+                48: "Depositing rime fog",
+                51: "Light drizzle",
+                53: "Moderate drizzle",
+                55: "Dense drizzle",
+                61: "Slight rain",
+                63: "Moderate rain",
+                65: "Heavy rain",
+                80: "Rain showers",
+                95: "Thunderstorm",
+            }
+            return code_map.get(int(code), "Unknown")
+
+        description = describe(weather_code)
+        parts = []
+        if temperature_c is not None:
+            parts.append(f"{temperature_c}°C")
+        if feels_like_c is not None:
+            parts.append(f"feels {feels_like_c}°C")
+        if humidity is not None:
+            parts.append(f"humidity {humidity}%")
+        if wind_speed is not None:
+            parts.append(f"wind {wind_speed} km/h")
+        metrics = ", ".join(parts) if parts else "n/a"
+        return f"Dubai, UAE: {description}, {metrics}"
+    except Exception:
+        return "Dubai, UAE: Weather data unavailable"
+
+
+def get_unix_time(city: str) -> str:
+    try:
+        r = requests.get("https://worldtimeapi.org/api/timezone/Asia/Dubai", timeout=(5, 10))
+        r.raise_for_status()
+        data = r.json()
+        u = data.get("unixtime")
+        if isinstance(u, int):
+            return str(u)
+        if isinstance(u, float):
+            return str(int(u))
+    except Exception:
+        pass
+    return str(int(time.time()))
+
+
+def change_time(city: str, time: str) -> str:
+    try:
+        ts = float(time)
+    except Exception:
+        return ""
+    if ts > 1_000_000_000_000:
+        ts = ts / 1000.0
+    key = (city or "").strip().lower()
+    if "dubai" in key or "uae" in key or "united arab emirates" in key:
+        try:
+            from zoneinfo import ZoneInfo
+            dt = datetime.fromtimestamp(ts, ZoneInfo("Asia/Dubai"))
+            return dt.strftime("%H:%M")
+        except Exception:
+            dt = datetime.utcfromtimestamp(ts) + timedelta(hours=4)
+            return (dt.replace(tzinfo=timezone(timedelta(hours=4))).strftime("%H:%M"))
+    try:
+        from zoneinfo import ZoneInfo
+        dt = datetime.fromtimestamp(ts, ZoneInfo("UTC"))
+        return dt.strftime("%H:%M")
+    except Exception:
+        dt = datetime.utcfromtimestamp(ts).replace(tzinfo=timezone.utc)
+        return dt.strftime("%H:%M")
+
+def change_time(city: str, time: str) -> str:
+    return time
 
 @dataclass
 class IndexedChunk:
@@ -160,8 +259,6 @@ class IndexedChunk:
 
 
 class InMemoryVectorStore:
-    """A minimal in-memory vector store with cosine similarity search."""
-
     def __init__(self) -> None:
         self._chunks: List[IndexedChunk] = []
         self._dim: Optional[int] = None
@@ -177,18 +274,16 @@ class InMemoryVectorStore:
     def add_chunks(self, chunks: List[str], metadata: dict) -> int:
         if not chunks:
             return 0
-            
-        # Use concurrent embedding for better performance
-        vectors = embed_texts(chunks, max_workers=5)
+        
+        vectors = embed_texts(chunks, max_workers=3)
         
         added = 0
         for idx, (chunk, vector) in enumerate(zip(chunks, vectors)):
-            if vector is None or vector.size == 1 and vector[0] == 0:  # Skip failed embeddings
+            if vector is None or vector.size == 1 and vector[0] == 0:
                 continue
             if self._dim is None:
                 self._dim = vector.size
             if vector.size != self._dim:
-                # Skip inconsistent embeddings
                 continue
             self._chunks.append(
                 IndexedChunk(content=chunk, metadata={**metadata, "chunk_index": idx}, embedding=vector)
@@ -199,15 +294,31 @@ class InMemoryVectorStore:
     def search(self, query: str, top_k: int = 4) -> List[IndexedChunk]:
         if not self._chunks:
             return []
+            
         query_vec = embed_text(query)
-        if query_vec is None or (self._dim is not None and query_vec.size != self._dim):
+        
+        if query_vec is None:
+            query_words = set(query.lower().split())
+            fallback_results = []
+            for chunk in self._chunks[:top_k * 2]: 
+                chunk_words = set(chunk.content.lower().split())
+                if query_words & chunk_words:
+                    fallback_results.append(chunk)
+            if fallback_results:
+                return fallback_results[:top_k]
             return []
+            
+        if self._dim is not None and query_vec.size != self._dim:
+            return []
+            
         scored: List[Tuple[float, IndexedChunk]] = []
         for ch in self._chunks:
             score = _cosine_similarity(query_vec, ch.embedding)
             scored.append((score, ch))
+            
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [c for _, c in scored[: max(1, top_k)]]
+        top_results = [c for _, c in scored[: max(1, top_k)]]
+        return top_results
 
 
 def stream_from_ollama(
@@ -301,15 +412,21 @@ def make_augmented_messages(
     use_files: bool,
     top_k: int,
 ) -> List[dict]:
-    """Create messages augmented with retrieved context if enabled."""
+    MAX_CONTEXT_CHARS_PER_CHUNK = 900
+    
     if use_files and vector_store and vector_store.size > 0:
         hits = vector_store.search(user_message, top_k=top_k)
+        
         if hits:
             context_blocks = []
             for i, h in enumerate(hits, start=1):
                 source = h.metadata.get("source", "uploaded-file")
                 idx = h.metadata.get("chunk_index", 0)
-                context_blocks.append(f"[Source: {source} | Chunk: {idx}]\n{h.content}")
+                trimmed = (h.content or "").strip()
+                if len(trimmed) > MAX_CONTEXT_CHARS_PER_CHUNK:
+                    trimmed = trimmed[:MAX_CONTEXT_CHARS_PER_CHUNK] + " …"
+                context_blocks.append(f"[Source: {source} | Chunk: {idx}]\n{trimmed}")
+                
             context_text = "\n\n---\n\n".join(context_blocks)
             augmented_user = (
                 "You have access to the following context extracted from user-uploaded files. "
@@ -318,17 +435,20 @@ def make_augmented_messages(
             )
             msgs = build_message_history(history_messages[:-1] + [{"role": "user", "content": augmented_user}], system_prompt)
             return msgs
-    # Default: no augmentation
     return build_message_history(history_messages, system_prompt)
 
 
 def ui() -> gr.Blocks:
+    weather_info = get_weather("Dubai")
+    dubai_unix = get_unix_time("Dubai")
+    dubai_time = change_time("Dubai", dubai_unix)
+    print(f"{weather_info} | Dubai time: {dubai_time}")
     default_system = (
         "You are an intelligent, polite, and highly professional AI assistant."
         + "Provide context-aware, accurate, and solution-oriented answers in 2–3 concise sentences."
         + "Maintain a respectful, diplomatic tone, using clear and precise language without unnecessary elaboration."
         + "Always prioritize clarity, relevance, and actionable value in your responses."
-    )
+    ) + f" Current Dubai weather: {weather_info}. Dubai time: {dubai_time}."
 
     with gr.Blocks(title="GPT-OSS:20B (Ollama)") as demo:
         gr.Markdown(
@@ -338,7 +458,6 @@ def ui() -> gr.Blocks:
 
         chat = gr.Chatbot(height=520, type="messages")
 
-        # RAG controls
         with gr.Accordion("File search (RAG)", open=False):
             with gr.Row():
                 files = gr.Files(label="Upload files", file_count="multiple", type="filepath")
@@ -391,7 +510,32 @@ def ui() -> gr.Blocks:
         def on_submit(user_message, chat_history, sp, temp, max_tok, tp, sd, vs_obj, use_files, k):
             chat_history = list(chat_history or [])
             chat_history.append({"role": "user", "content": user_message})
-            # Build augmented messages for the model call
+            lower_msg = (user_message or "").lower()
+            wants_live = any(t in lower_msg for t in ["time", "weather", "temperature", "clock"])
+            if wants_live:
+                try:
+                    wu = get_unix_time("Dubai")
+                    try:
+                        from zoneinfo import ZoneInfo
+                        dt = datetime.fromtimestamp(int(wu), ZoneInfo("Asia/Dubai"))
+                    except Exception:
+                        dt = datetime.utcfromtimestamp(int(wu)) + timedelta(hours=4)
+                    time24 = dt.strftime("%H:%M")
+                    time12 = dt.strftime("%I %p").lstrip("0")
+                    w = get_weather("Dubai")
+                    if w.startswith("Dubai, UAE: "):
+                        weather_line = "Dubai weather: " + w.split(": ", 1)[1]
+                    else:
+                        weather_line = "Dubai weather: " + w
+                    if not weather_line.endswith("."):
+                        weather_line += "."
+                    response_text = weather_line + "\n" + f"Current time: {time24} Dubai time ({time12})"
+                except Exception:
+                    response_text = ""
+                chat_history.append({"role": "assistant", "content": response_text})
+                yield chat_history
+                return
+
             messages = make_augmented_messages(
                 history_messages=chat_history,
                 system_prompt=sp,
@@ -408,7 +552,6 @@ def ui() -> gr.Blocks:
                 seed=int(sd),
             )
             chat_history.append({"role": "assistant", "content": ""})
-
             for partial in stream:
                 chat_history[-1]["content"] = partial
                 yield chat_history
@@ -433,12 +576,10 @@ def ui() -> gr.Blocks:
                 file_chunks = len(chunks)
                 total_chunks += file_chunks
                 
-                # Add chunks with progress tracking
                 added = vs.add_chunks(chunks, metadata={"source": os.path.basename(path)})
                 total_added += added
                 
                 file_time = time.time() - file_start
-                print(f"Processed {os.path.basename(path)}: {file_chunks} chunks in {file_time:.2f}s")
             
             total_time = time.time() - start_time
             status = (
@@ -459,7 +600,6 @@ def ui() -> gr.Blocks:
             outputs=[chat],
         )
 
-        # File events
         files.upload(fn=index_files, inputs=[files, vs_state], outputs=[vs_state, rag_status])
         clear_vs.click(fn=clear_index, inputs=[vs_state], outputs=[vs_state, rag_status])
 
