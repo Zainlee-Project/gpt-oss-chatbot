@@ -159,13 +159,17 @@ def get_weather(city: str) -> str:
                 "latitude": latitude,
                 "longitude": longitude,
                 "current": "temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,weather_code",
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max",
                 "timezone": "Asia/Dubai",
+                "forecast_days": "3",
             },
             timeout=(5, 10),
         )
         response.raise_for_status()
         payload = response.json()
         current = payload.get("current") or {}
+        daily = payload.get("daily") or {}
+        
         temperature_c = current.get("temperature_2m")
         feels_like_c = current.get("apparent_temperature")
         humidity = current.get("relative_humidity_2m")
@@ -176,35 +180,53 @@ def get_weather(city: str) -> str:
             if code is None:
                 return "Unknown"
             code_map = {
-                0: "Clear",
-                1: "Mainly clear",
-                2: "Partly cloudy",
-                3: "Overcast",
-                45: "Fog",
-                48: "Depositing rime fog",
-                51: "Light drizzle",
-                53: "Moderate drizzle",
-                55: "Dense drizzle",
-                61: "Slight rain",
-                63: "Moderate rain",
-                65: "Heavy rain",
-                80: "Rain showers",
+                0: "Clear", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+                45: "Fog", 48: "Depositing rime fog", 51: "Light drizzle",
+                53: "Moderate drizzle", 55: "Dense drizzle", 61: "Slight rain",
+                63: "Moderate rain", 65: "Heavy rain", 80: "Rain showers",
                 95: "Thunderstorm",
             }
             return code_map.get(int(code), "Unknown")
 
-        description = describe(weather_code)
-        parts = []
+        current_desc = describe(weather_code)
+        current_parts = []
         if temperature_c is not None:
-            parts.append(f"{temperature_c}°C")
+            current_parts.append(f"{temperature_c}°C")
         if feels_like_c is not None:
-            parts.append(f"feels {feels_like_c}°C")
+            current_parts.append(f"feels {feels_like_c}°C")
         if humidity is not None:
-            parts.append(f"humidity {humidity}%")
+            current_parts.append(f"humidity {humidity}%")
         if wind_speed is not None:
-            parts.append(f"wind {wind_speed} km/h")
-        metrics = ", ".join(parts) if parts else "n/a"
-        return f"Dubai, UAE: {description}, {metrics}"
+            current_parts.append(f"wind {wind_speed} km/h")
+        current_metrics = ", ".join(current_parts) if current_parts else "n/a"
+        
+        result = f"Dubai, UAE: {current_desc}, {current_metrics}"
+        
+        daily_codes = daily.get("weather_code", [])
+        daily_max_temps = daily.get("temperature_2m_max", [])
+        daily_min_temps = daily.get("temperature_2m_min", [])
+        daily_precipitation = daily.get("precipitation_sum", [])
+        
+        if len(daily_codes) >= 3 and len(daily_max_temps) >= 3:
+            forecast_parts = []
+            days = ["Today", "Tomorrow", "Day after"]
+            for i in range(min(3, len(daily_codes))):
+                day_desc = describe(daily_codes[i] if i < len(daily_codes) else None)
+                max_temp = daily_max_temps[i] if i < len(daily_max_temps) else None
+                min_temp = daily_min_temps[i] if i < len(daily_min_temps) else None
+                precip = daily_precipitation[i] if i < len(daily_precipitation) else None
+                
+                day_info = f"{days[i]}: {day_desc}"
+                if max_temp is not None and min_temp is not None:
+                    day_info += f", {min_temp}°C-{max_temp}°C"
+                if precip is not None and precip > 0:
+                    day_info += f", rain {precip}mm"
+                forecast_parts.append(day_info)
+            
+            if forecast_parts:
+                result += ". Forecast: " + "; ".join(forecast_parts)
+        
+        return result
     except Exception:
         return "Dubai, UAE: Weather data unavailable"
 
@@ -248,8 +270,7 @@ def change_time(city: str, time: str) -> str:
         dt = datetime.utcfromtimestamp(ts).replace(tzinfo=timezone.utc)
         return dt.strftime("%H:%M")
 
-def change_time(city: str, time: str) -> str:
-    return time
+
 
 @dataclass
 class IndexedChunk:
@@ -444,10 +465,12 @@ def ui() -> gr.Blocks:
     dubai_time = change_time("Dubai", dubai_unix)
     print(f"{weather_info} | Dubai time: {dubai_time}")
     default_system = (
-        "You are an intelligent, polite, and highly professional AI assistant."
-        + "Provide context-aware, accurate, and solution-oriented answers in 2–3 concise sentences."
-        + "Maintain a respectful, diplomatic tone, using clear and precise language without unnecessary elaboration."
-        + "Always prioritize clarity, relevance, and actionable value in your responses."
+        "You are an intelligent, polite, and highly professional AI assistant with access to real-time data. "
+        "Always start responses with a friendly greeting like 'Hi!' "
+        "When you receive current information in your knowledge base, use it confidently as live, real-time data. "
+        "Provide context-aware, accurate, and solution-oriented answers in 2-3 concise sentences. "
+        "Maintain a respectful, diplomatic tone, using clear and precise language without unnecessary elaboration. "
+        "Always prioritize clarity, relevance, and actionable value in your responses."
     )
 
     with gr.Blocks(title="GPT-OSS:20B (Ollama)") as demo:
@@ -467,6 +490,11 @@ def ui() -> gr.Blocks:
                 clear_vs = gr.Button("Clear indexed data")
             rag_status = gr.Markdown(value="No files indexed yet.")
             vs_state = gr.State(InMemoryVectorStore())
+
+        with gr.Accordion("Logs", open=False):
+            logs_box = gr.Textbox(label="Logs", value="", lines=18, interactive=False)
+            clear_logs = gr.Button("Clear logs")
+            logs_state = gr.State("")
 
         with gr.Row():
             msg_box = gr.Textbox(
@@ -507,12 +535,16 @@ def ui() -> gr.Blocks:
                     label="Seed (for reproducibility)", value=0, precision=0
                 )
 
-        def on_submit(user_message, chat_history, sp, temp, max_tok, tp, sd, vs_obj, use_files, k):
+        def on_submit(user_message, chat_history, sp, temp, max_tok, tp, sd, vs_obj, use_files, k, logs_text):
             chat_history = list(chat_history or [])
             chat_history.append({"role": "user", "content": user_message})
             lower_msg = (user_message or "").lower()
-            wants_live = any(t in lower_msg for t in ["time", "weather", "temperature", "clock"]) 
-            sp_to_use = sp
+            wants_live = any(t in lower_msg for t in ["time", "weather", "temperature", "clock"])
+            log_lines = []
+            now_str = datetime.utcnow().isoformat()
+            log_lines.append(f"[{now_str}] user: {user_message}")
+            log_lines.append(f"[{now_str}] detect: wants_live={wants_live}")
+            
             if wants_live:
                 try:
                     wu = get_unix_time("Dubai")
@@ -524,25 +556,64 @@ def ui() -> gr.Blocks:
                     time24 = dt.strftime("%H:%M")
                     time12 = dt.strftime("%I %p").lstrip("0")
                     w = get_weather("Dubai")
-                    if w.startswith("Dubai, UAE: "):
-                        weather_line = "Dubai weather: " + w.split(": ", 1)[1]
+                    
+                    wants_time = any(t in lower_msg for t in ["time", "clock"])
+                    wants_weather = any(t in lower_msg for t in ["weather", "temperature"])
+                    
+                    knowledge_facts = []
+                    if wants_weather:
+                        if w.startswith("Dubai, UAE: "):
+                            weather_info = w.split(": ", 1)[1]
+                        else:
+                            weather_info = w
+                        knowledge_facts.append(f"Current Dubai weather is {weather_info}")
+                        log_lines.append(f"[{now_str}] weather: {weather_info}")
+                    
+                    if wants_time:
+                        knowledge_facts.append(f"Current Dubai time is {time24} ({time12})")
+                        log_lines.append(f"[{now_str}] time: {time24} ({time12})")
+                    
+                    if knowledge_facts:
+                        knowledge_base = ". ".join(knowledge_facts) + "."
+                        enhanced_prompt = (sp or "") + f"\n\nYou have access to real-time data. Current information: {knowledge_base}"
+                        log_lines.append(f"[{now_str}] knowledge: {knowledge_base}")
+                        
+                        messages = make_augmented_messages(
+                            history_messages=chat_history,
+                            system_prompt=enhanced_prompt,
+                            user_message=user_message,
+                            vector_store=vs_obj,
+                            use_files=bool(use_files),
+                            top_k=int(k or 4),
+                        )
                     else:
-                        weather_line = "Dubai weather: " + w
-                    if not weather_line.endswith("."):
-                        weather_line += "."
-                    live_fact = weather_line + " " + f"Current time: {time24} Dubai time ({time12})."
-                    sp_to_use = (sp or "") + "\n\n" + "Use the following live facts to answer succinctly in two lines without repeating them verbatim:" + "\n" + live_fact
+                        messages = make_augmented_messages(
+                            history_messages=chat_history,
+                            system_prompt=sp,
+                            user_message=user_message,
+                            vector_store=vs_obj,
+                            use_files=bool(use_files),
+                            top_k=int(k or 4),
+                        )
                 except Exception:
-                    pass
-
-            messages = make_augmented_messages(
-                history_messages=chat_history,
-                system_prompt=sp_to_use,
-                user_message=user_message,
-                vector_store=vs_obj,
-                use_files=bool(use_files), 
-                top_k=int(k or 4),
-            )
+                    messages = make_augmented_messages(
+                        history_messages=chat_history,
+                        system_prompt=sp,
+                        user_message=user_message,
+                        vector_store=vs_obj,
+                        use_files=bool(use_files),
+                        top_k=int(k or 4),
+                    )
+            else:
+                messages = make_augmented_messages(
+                    history_messages=chat_history,
+                    system_prompt=sp,
+                    user_message=user_message,
+                    vector_store=vs_obj,
+                    use_files=bool(use_files),
+                    top_k=int(k or 4),
+                )
+            
             stream = stream_from_ollama(
                 messages=messages,
                 temperature=temp,
@@ -550,10 +621,12 @@ def ui() -> gr.Blocks:
                 max_tokens=max_tok,
                 seed=int(sd),
             )
+            log_lines.append(f"[{now_str}] model: {MODEL_NAME} temp={temp} top_p={tp} max_tokens={max_tok} seed={sd}")
+            logs_text = (logs_text or "") + ("\n".join(log_lines) + "\n")
             chat_history.append({"role": "assistant", "content": ""})
             for partial in stream:
                 chat_history[-1]["content"] = partial
-                yield chat_history
+                yield chat_history, logs_text
 
         def index_files(file_paths, vs_obj: InMemoryVectorStore):
             vs = vs_obj or InMemoryVectorStore()
@@ -593,11 +666,19 @@ def ui() -> gr.Blocks:
             vs.clear()
             return vs, "Index cleared. No files indexed yet."
 
+        def submit_and_clear(user_message, chat_history, sp, temp, max_tok, tp, sd, vs_obj, use_files, k, logs_text):
+            for chat_out, logs_out in on_submit(user_message, chat_history, sp, temp, max_tok, tp, sd, vs_obj, use_files, k, logs_text):
+                yield chat_out, "", logs_out
+        
         msg_box.submit(
-            fn=on_submit,
-            inputs=[msg_box, chat, system_prompt, temperature, max_tokens, top_p, seed, vs_state, use_rag, top_k],
-            outputs=[chat],
+            fn=submit_and_clear,
+            inputs=[msg_box, chat, system_prompt, temperature, max_tokens, top_p, seed, vs_state, use_rag, top_k, logs_state],
+            outputs=[chat, msg_box, logs_box],
         )
+
+        def clear_logs_fn():
+            return "", ""
+        clear_logs.click(fn=clear_logs_fn, inputs=[], outputs=[logs_state, logs_box])
 
         files.upload(fn=index_files, inputs=[files, vs_state], outputs=[vs_state, rag_status])
         clear_vs.click(fn=clear_index, inputs=[vs_state], outputs=[vs_state, rag_status])
