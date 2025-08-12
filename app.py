@@ -2,6 +2,8 @@ import os
 import json
 from dataclasses import dataclass
 from typing import Generator, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 
 import gradio as gr
 import requests
@@ -41,7 +43,7 @@ def embed_text(text: str) -> Optional[np.ndarray]:
     url = f"{OLLAMA_URL}/api/embeddings"
     payload = {"model": EMBED_MODEL, "prompt": text}
     try:
-        resp = _http_post(url, payload, stream=False, timeout=(10, 120))
+        resp = _http_post(url, payload, stream=False, timeout=(5, 60))
         resp.raise_for_status()
         data = resp.json()
         vector = np.array(data.get("embedding", []), dtype=np.float32)
@@ -52,15 +54,41 @@ def embed_text(text: str) -> Optional[np.ndarray]:
         return None
 
 
-def embed_texts(texts: List[str]) -> List[np.ndarray]:
-    """Embed a list of texts. Falls back gracefully on failures."""
-    vectors: List[np.ndarray] = []
-    for text in texts:
-        vector = embed_text(text)
+def embed_texts(texts: List[str], max_workers: int = 5) -> List[np.ndarray]:
+    """Embed a list of texts using concurrent processing for better performance."""
+    if not texts:
+        return []
+    
+    vectors: List[Optional[np.ndarray]] = [None] * len(texts)
+    
+    def embed_with_index(idx_text_pair):
+        idx, text = idx_text_pair
+        return idx, embed_text(text)
+    
+    # Use ThreadPoolExecutor for concurrent API calls
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {
+            executor.submit(embed_with_index, (i, text)): i 
+            for i, text in enumerate(texts)
+        }
+        
+        for future in as_completed(future_to_idx):
+            try:
+                idx, vector = future.result()
+                vectors[idx] = vector
+            except Exception:
+                # Keep None for failed embeddings
+                pass
+    
+    # Convert None values to zero vectors for alignment
+    result_vectors: List[np.ndarray] = []
+    for vector in vectors:
         if vector is None:
-            vector = np.zeros(1, dtype=np.float32)  # placeholder to keep alignment
-        vectors.append(vector)
-    return vectors
+            result_vectors.append(np.zeros(1, dtype=np.float32))
+        else:
+            result_vectors.append(vector)
+    
+    return result_vectors
 
 
 def read_text_from_file(file_path: str) -> str:
@@ -100,7 +128,7 @@ def read_text_from_file(file_path: str) -> str:
     return ""
 
 
-def chunk_text(text: str, max_chars: int = 2000, overlap: int = 200) -> List[str]:
+def chunk_text(text: str, max_chars: int = 3000, overlap: int = 300) -> List[str]:
     """Split text into overlapping chunks by characters.
 
     This is a pragmatic approach that avoids tokenizers while producing
@@ -147,10 +175,15 @@ class InMemoryVectorStore:
         self._dim = None
 
     def add_chunks(self, chunks: List[str], metadata: dict) -> int:
+        if not chunks:
+            return 0
+            
+        # Use concurrent embedding for better performance
+        vectors = embed_texts(chunks, max_workers=5)
+        
         added = 0
-        for idx, chunk in enumerate(chunks):
-            vector = embed_text(chunk)
-            if vector is None:
+        for idx, (chunk, vector) in enumerate(zip(chunks, vectors)):
+            if vector is None or vector.size == 1 and vector[0] == 0:  # Skip failed embeddings
                 continue
             if self._dim is None:
                 self._dim = vector.size
@@ -385,20 +418,33 @@ def ui() -> gr.Blocks:
             paths = [p for p in (file_paths or []) if isinstance(p, str) and os.path.exists(p)]
             if not paths:
                 return vs, "No valid files provided."
+            
+            start_time = time.time()
             total_chunks = 0
             total_added = 0
-            for path in paths:
+            
+            for i, path in enumerate(paths, 1):
+                file_start = time.time()
                 text = read_text_from_file(path)
                 if not text:
                     continue
+                    
                 chunks = chunk_text(text)
-                total_chunks += len(chunks)
+                file_chunks = len(chunks)
+                total_chunks += file_chunks
+                
+                # Add chunks with progress tracking
                 added = vs.add_chunks(chunks, metadata={"source": os.path.basename(path)})
                 total_added += added
+                
+                file_time = time.time() - file_start
+                print(f"Processed {os.path.basename(path)}: {file_chunks} chunks in {file_time:.2f}s")
+            
+            total_time = time.time() - start_time
             status = (
-                f"Indexed {len(paths)} file(s). Created {total_chunks} chunk(s); "
-                f"{total_added} embedded. Current store size: {vs.size}.\n"
-                f"Embed model: `{EMBED_MODEL}`"
+                f"✅ Indexed {len(paths)} file(s) in {total_time:.2f} seconds.\n"
+                f"Created {total_chunks} chunk(s); {total_added} embedded successfully.\n"
+                f"Current store size: {vs.size} chunks. Embed model: `{EMBED_MODEL}`"
             )
             return vs, status
 
