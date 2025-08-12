@@ -448,7 +448,7 @@ def ui() -> gr.Blocks:
         + "Provide context-aware, accurate, and solution-oriented answers in 2–3 concise sentences."
         + "Maintain a respectful, diplomatic tone, using clear and precise language without unnecessary elaboration."
         + "Always prioritize clarity, relevance, and actionable value in your responses."
-    ) + f" Current Dubai weather: {weather_info}. Dubai time: {dubai_time}."
+    )
 
     with gr.Blocks(title="GPT-OSS:20B (Ollama)") as demo:
         gr.Markdown(
@@ -511,7 +511,8 @@ def ui() -> gr.Blocks:
             chat_history = list(chat_history or [])
             chat_history.append({"role": "user", "content": user_message})
             lower_msg = (user_message or "").lower()
-            wants_live = any(t in lower_msg for t in ["time", "weather", "temperature", "clock"])
+            wants_live = any(t in lower_msg for t in ["time", "weather", "temperature", "clock"]) 
+            sp_to_use = sp
             if wants_live:
                 try:
                     wu = get_unix_time("Dubai")
@@ -529,19 +530,17 @@ def ui() -> gr.Blocks:
                         weather_line = "Dubai weather: " + w
                     if not weather_line.endswith("."):
                         weather_line += "."
-                    response_text = weather_line + "\n" + f"Current time: {time24} Dubai time ({time12})"
+                    live_fact = weather_line + " " + f"Current time: {time24} Dubai time ({time12})."
+                    sp_to_use = (sp or "") + "\n\n" + "Use the following live facts to answer succinctly in two lines without repeating them verbatim:" + "\n" + live_fact
                 except Exception:
-                    response_text = ""
-                chat_history.append({"role": "assistant", "content": response_text})
-                yield chat_history
-                return
+                    pass
 
             messages = make_augmented_messages(
                 history_messages=chat_history,
-                system_prompt=sp,
+                system_prompt=sp_to_use,
                 user_message=user_message,
                 vector_store=vs_obj,
-                use_files=bool(use_files),
+                use_files=bool(use_files), 
                 top_k=int(k or 4),
             )
             stream = stream_from_ollama(
