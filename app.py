@@ -465,6 +465,7 @@ def ui() -> gr.Blocks:
     dubai_time = change_time("Dubai", dubai_unix)
     print(f"{weather_info} | Dubai time: {dubai_time}")
     default_system = (
+        "Reasoning: low"
         "You are an intelligent, polite, and highly professional AI assistant with access to real-time data. "
         "Always start responses with a friendly greeting like 'Hi!' "
         "When you receive current information in your knowledge base, use it confidently as live, real-time data. "
@@ -479,7 +480,11 @@ def ui() -> gr.Blocks:
             "Chat with the locally running Ollama model."
         )
 
-        chat = gr.Chatbot(height=520, type="messages")
+        chat = gr.Chatbot(
+            height=520,
+            type="messages",
+            value=[{"role": "assistant", "content": "How can I help you?"}],
+        )
 
         with gr.Accordion("File search (RAG)", open=False):
             with gr.Row():
